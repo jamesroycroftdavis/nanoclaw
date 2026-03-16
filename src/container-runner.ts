@@ -169,7 +169,9 @@ function buildVolumeMounts(
       const dstDir = path.join(skillsDst, skillDir);
       fs.cpSync(srcDir, dstDir, {
         recursive: true,
-        filter: (src) => !src.includes(`${path.sep}.git${path.sep}`) && !src.endsWith(`${path.sep}.git`),
+        filter: (src) =>
+          !src.includes(`${path.sep}.git${path.sep}`) &&
+          !src.endsWith(`${path.sep}.git`),
       });
     }
   }

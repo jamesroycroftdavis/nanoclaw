@@ -106,7 +106,10 @@ async function classify(text: string): Promise<string> {
             ) {
               resolve(result);
             } else {
-              logger.debug({ statusCode: res.statusCode, body: data.slice(0, 300) }, 'Router unexpected response');
+              logger.debug(
+                { statusCode: res.statusCode, body: data.slice(0, 300) },
+                'Router unexpected response',
+              );
               reject(new Error(`Unexpected classification: ${result}`));
             }
           } catch (err) {
