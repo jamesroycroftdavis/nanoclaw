@@ -11,6 +11,7 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+import { transcribeAudio } from '../transcription.js';
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -38,6 +39,139 @@ async function sendTelegramMessage(
     // Fallback: send as plain text if Markdown parsing fails
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
     await api.sendMessage(chatId, text, options);
+  }
+}
+
+// Bot pool for agent teams: send-only Api instances (no polling)
+const poolApis: Api[] = [];
+// Maps "{groupFolder}:{senderName}" → pool Api index for stable assignment
+const senderBotMap = new Map<string, number>();
+let nextPoolIndex = 0;
+
+/**
+ * Initialize send-only Api instances for the bot pool.
+ * Each pool bot can send messages but doesn't poll for updates.
+ */
+export async function initBotPool(tokens: string[]): Promise<void> {
+  for (const token of tokens) {
+    try {
+      const api = new Api(token);
+      const me = await api.getMe();
+      poolApis.push(api);
+      logger.info(
+        { username: me.username, id: me.id, poolSize: poolApis.length },
+        'Pool bot initialized',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to initialize pool bot');
+    }
+  }
+  if (poolApis.length > 0) {
+    logger.info({ count: poolApis.length }, 'Telegram bot pool ready');
+  }
+}
+
+// Forum topic name → thread_id mapping per group
+// Key: chatJid, Value: map of lowercase topic name → thread_id
+const forumTopics = new Map<string, Map<string, number>>();
+
+/**
+ * Register forum topics for a group.
+ * Called at startup from config.
+ */
+export function registerForumTopics(
+  chatJid: string,
+  topics: Record<string, number>,
+): void {
+  const map = new Map<string, number>();
+  for (const [name, threadId] of Object.entries(topics)) {
+    map.set(name.toLowerCase(), threadId);
+  }
+  forumTopics.set(chatJid, map);
+  logger.info({ chatJid, topics }, 'Forum topics registered');
+}
+
+/**
+ * Resolve a topic name to a thread_id for a given chat.
+ */
+function resolveTopicThreadId(
+  chatJid: string,
+  topic?: string,
+): number | undefined {
+  if (!topic) return undefined;
+  const map = forumTopics.get(chatJid);
+  if (!map) return undefined;
+  return map.get(topic.toLowerCase());
+}
+
+/**
+ * Send a message via a pool bot assigned to the given sender name.
+ * Assigns bots round-robin on first use; subsequent messages from the
+ * same sender in the same group always use the same bot.
+ * On first assignment, renames the bot to match the sender's role.
+ * If topic is specified, routes to the corresponding forum thread.
+ */
+export async function sendPoolMessage(
+  chatId: string,
+  text: string,
+  sender: string,
+  groupFolder: string,
+  topic?: string,
+): Promise<void> {
+  if (poolApis.length === 0) {
+    return;
+  }
+
+  const key = `${groupFolder}:${sender}`;
+  let idx = senderBotMap.get(key);
+  if (idx === undefined) {
+    idx = nextPoolIndex % poolApis.length;
+    nextPoolIndex++;
+    senderBotMap.set(key, idx);
+    // Rename the bot to match the sender's role, then wait for Telegram to propagate
+    try {
+      await poolApis[idx].setMyName(sender);
+      await new Promise((r) => setTimeout(r, 2000));
+      logger.info(
+        { sender, groupFolder, poolIndex: idx },
+        'Assigned and renamed pool bot',
+      );
+    } catch (err) {
+      logger.warn(
+        { sender, err },
+        'Failed to rename pool bot (sending anyway)',
+      );
+    }
+  }
+
+  const api = poolApis[idx];
+  const threadId = resolveTopicThreadId(chatId, topic);
+  const options: { message_thread_id?: number } = {};
+  if (threadId) {
+    options.message_thread_id = threadId;
+  }
+
+  try {
+    const numericId = chatId.replace(/^tg:/, '');
+    const MAX_LENGTH = 4096;
+    if (text.length <= MAX_LENGTH) {
+      await sendTelegramMessage(api, numericId, text, options);
+    } else {
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        await sendTelegramMessage(
+          api,
+          numericId,
+          text.slice(i, i + MAX_LENGTH),
+          options,
+        );
+      }
+    }
+    logger.info(
+      { chatId, sender, topic, threadId, poolIndex: idx, length: text.length },
+      'Pool message sent',
+    );
+  } catch (err) {
+    logger.error({ chatId, sender, topic, err }, 'Failed to send pool message');
   }
 }
 
@@ -201,7 +335,28 @@ export class TelegramChannel implements Channel {
 
     this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      let placeholder = '[Voice message]';
+      try {
+        const file = await ctx.getFile();
+        const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+        const res = await fetch(url);
+        if (res.ok) {
+          const buffer = Buffer.from(await res.arrayBuffer());
+          const transcript = await transcribeAudio(buffer);
+          if (transcript) {
+            placeholder = `[Voice: ${transcript}]`;
+          }
+        }
+      } catch (err) {
+        logger.error({ err }, 'Failed to download/transcribe voice');
+      }
+      storeNonText(ctx, placeholder);
+    });
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';

@@ -67,6 +67,17 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+// Model configuration: main group uses primary, others use secondary
+export const PRIMARY_MODEL = process.env.PRIMARY_MODEL || 'claude-opus-4-6';
+export const SECONDARY_MODEL =
+  process.env.SECONDARY_MODEL || 'claude-sonnet-4-6';
+
+// Telegram bot pool for agent swarm (comma-separated tokens)
+export const TELEGRAM_BOT_POOL = (process.env.TELEGRAM_BOT_POOL || '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =

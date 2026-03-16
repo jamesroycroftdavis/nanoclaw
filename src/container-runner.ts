@@ -14,6 +14,8 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  PRIMARY_MODEL,
+  SECONDARY_MODEL,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -26,6 +28,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -41,6 +44,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  model?: string;
 }
 
 export interface ContainerOutput {
@@ -91,6 +95,15 @@ function buildVolumeMounts(
     mounts.push({
       hostPath: groupDir,
       containerPath: '/workspace/group',
+      readonly: false,
+    });
+
+    // Main gets writable access to global (shared memory)
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    fs.mkdirSync(path.join(globalDir, 'memory'), { recursive: true });
+    mounts.push({
+      hostPath: globalDir,
+      containerPath: '/workspace/global',
       readonly: false,
     });
   } else {
@@ -154,7 +167,10 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      fs.cpSync(srcDir, dstDir, {
+        recursive: true,
+        filter: (src) => !src.includes(`${path.sep}.git${path.sep}`) && !src.endsWith(`${path.sep}.git`),
+      });
     }
   }
   mounts.push({
@@ -236,6 +252,44 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Pass tool API keys if configured
+  const toolSecrets = readEnvFile([
+    'FIRECRAWL_API_KEY',
+    'APIFY_TOKEN',
+    'NOTION_API_KEY',
+  ]);
+  const firecrawlKey =
+    process.env.FIRECRAWL_API_KEY || toolSecrets.FIRECRAWL_API_KEY;
+  if (firecrawlKey) {
+    args.push('-e', `FIRECRAWL_API_KEY=${firecrawlKey}`);
+  }
+
+  // Pass Apify token if configured
+  const apifyToken = process.env.APIFY_TOKEN || toolSecrets.APIFY_TOKEN;
+  if (apifyToken) {
+    args.push('-e', `APIFY_TOKEN=${apifyToken}`);
+  }
+
+  // Pass Notion API key if configured
+  const notionKey = process.env.NOTION_API_KEY || toolSecrets.NOTION_API_KEY;
+  if (notionKey) {
+    args.push('-e', `NOTION_API_KEY=${notionKey}`);
+  }
+
+  // Pass Maton API key if configured (API Gateway skill)
+  const matonSecrets = readEnvFile(['MATON_API_KEY', 'HINDSIGHT_API_KEY']);
+  const matonKey = process.env.MATON_API_KEY || matonSecrets.MATON_API_KEY;
+  if (matonKey) {
+    args.push('-e', `MATON_API_KEY=${matonKey}`);
+  }
+
+  // Pass Hindsight API key if configured (memory system)
+  const hindsightKey =
+    process.env.HINDSIGHT_API_KEY || matonSecrets.HINDSIGHT_API_KEY;
+  if (hindsightKey) {
+    args.push('-e', `HINDSIGHT_API_KEY=${hindsightKey}`);
   }
 
   // Runtime-specific args for host gateway resolution

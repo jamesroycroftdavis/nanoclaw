@@ -6,6 +6,9 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  PRIMARY_MODEL,
+  SECONDARY_MODEL,
+  TELEGRAM_BOT_POOL,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -44,7 +47,9 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { initBotPool, registerForumTopics } from './channels/telegram.js';
 import { startIpcWatcher } from './ipc.js';
+import { routeModel } from './model-router.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   restoreRemoteControl,
@@ -265,6 +270,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * Detect model override in message text.
+ * Matches "use opus", "use sonnet", "use haiku" (case-insensitive).
+ */
+function detectModelOverride(text: string): string | undefined {
+  const match = text.match(/\buse\s+(opus|sonnet|haiku)\b/i);
+  if (!match) return undefined;
+  const name = match[1].toLowerCase();
+  const models: Record<string, string> = {
+    opus: 'claude-opus-4-6',
+    sonnet: 'claude-sonnet-4-6',
+    haiku: 'claude-haiku-4-5-20251001',
+  };
+  return models[name];
+}
+
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
@@ -320,6 +341,9 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        model:
+          detectModelOverride(prompt) ||
+          (await routeModel(prompt, isMain ? PRIMARY_MODEL : SECONDARY_MODEL)),
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -596,6 +620,19 @@ async function main(): Promise<void> {
     logger.fatal('No channels connected');
     process.exit(1);
   }
+
+  // Initialize Telegram bot pool for agent swarm
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
+  }
+
+  // Register forum topics for groups that use them
+  registerForumTopics('tg:-1003774467440', {
+    general: 1,
+    engineering: 2,
+    research: 3,
+    marketing: 4,
+  });
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({

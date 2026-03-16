@@ -45,6 +45,7 @@ server.tool(
   {
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
+    topic: z.string().optional().describe('Forum topic to post in (e.g. "Engineering", "Research", "Marketing"). Routes the message to that topic thread in Telegram groups with Topics enabled.'),
   },
   async (args) => {
     const data: Record<string, string | undefined> = {
@@ -52,6 +53,7 @@ server.tool(
       chatJid,
       text: args.text,
       sender: args.sender || undefined,
+      topic: args.topic || undefined,
       groupFolder,
       timestamp: new Date().toISOString(),
     };
@@ -330,6 +332,131 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+// ===== Hindsight Memory System =====
+const HINDSIGHT_URL = 'https://api.hindsight.vectorize.io';
+const HINDSIGHT_KEY = process.env.HINDSIGHT_API_KEY || '';
+const HINDSIGHT_BANK = 'claw';
+
+async function hindsightRequest(method: string, path: string, body?: object): Promise<any> {
+  const url = `${HINDSIGHT_URL}${path}`;
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${HINDSIGHT_KEY}`,
+    'Content-Type': 'application/json',
+  };
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Hindsight API error ${res.status}: ${err}`);
+  }
+  return res.json();
+}
+
+server.tool(
+  'remember',
+  `Store important information to long-term memory. Use this whenever you learn something worth remembering: decisions, preferences, research findings, project context, people, corrections, errors. Memory is shared across all agents and persists forever.
+
+Tags help organize and filter memories later. Use consistent tag formats:
+- agent:<role> (who stored it: agent:ceo, agent:researcher, agent:cmo)
+- project:<name> (which project: project:taylor, project:nanoclaw)
+- type:<kind> (what kind: type:decision, type:research, type:preference, type:error, type:learning)`,
+  {
+    content: z.string().describe('The information to remember. Be specific and include context — why it matters, not just what happened.'),
+    context: z.string().optional().describe('Short label for the source/situation: "competitor research", "user correction", "team meeting", "strategy session"'),
+    tags: z.array(z.string()).optional().describe('Tags for organization: ["agent:researcher", "project:taylor", "type:research"]'),
+    notion_url: z.string().optional().describe('Link to related Notion document if one was published'),
+  },
+  async (args) => {
+    if (!HINDSIGHT_KEY) {
+      return { content: [{ type: 'text' as const, text: 'Hindsight memory not configured (no API key).' }], isError: true };
+    }
+    try {
+      const body: Record<string, any> = {
+        content: args.content,
+        context: args.context || undefined,
+        tags: args.tags || undefined,
+      };
+      if (args.notion_url) {
+        body.metadata = { notion_url: args.notion_url };
+      }
+      await hindsightRequest('POST', `/v1/default/banks/${HINDSIGHT_BANK}/memories`, { items: [body] });
+      return { content: [{ type: 'text' as const, text: 'Stored to memory.' }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Memory store failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'recall_memory',
+  `Search long-term memory for relevant information. Use this before starting complex tasks, when James references past work, or when you need context about projects, people, or decisions. Memory is shared — you can find things other agents stored.`,
+  {
+    query: z.string().describe('Natural language search query: "What do we know about Taylor competitors?", "James preferences for reports"'),
+    max_tokens: z.number().optional().describe('How much context to return (default 4096). Use 2048 for quick lookups, 8192 for deep research.'),
+    budget: z.enum(['low', 'mid', 'high']).optional().describe('Search depth: low=fast, mid=balanced, high=thorough (default: mid)'),
+    tags: z.array(z.string()).optional().describe('Filter by tags: ["project:taylor"] to only find Taylor-related memories'),
+  },
+  async (args) => {
+    if (!HINDSIGHT_KEY) {
+      return { content: [{ type: 'text' as const, text: 'Hindsight memory not configured (no API key).' }], isError: true };
+    }
+    try {
+      const body: Record<string, any> = {
+        query: args.query,
+        max_tokens: args.max_tokens || 4096,
+        budget: args.budget || 'mid',
+      };
+      if (args.tags && args.tags.length > 0) {
+        body.tags = args.tags;
+        body.tags_match = 'any';
+      }
+      const result = await hindsightRequest('POST', `/v1/default/banks/${HINDSIGHT_BANK}/memories/recall`, body);
+      const memories = result.results || [];
+      if (memories.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No relevant memories found.' }] };
+      }
+      const formatted = memories.map((m: any, i: number) =>
+        `[${i + 1}] ${m.text}${m.metadata?.notion_url ? `\n   Notion: ${m.metadata.notion_url}` : ''}${m.tags?.length ? `\n   Tags: ${m.tags.join(', ')}` : ''}`
+      ).join('\n\n');
+      return { content: [{ type: 'text' as const, text: `Found ${memories.length} memories:\n\n${formatted}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Memory recall failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'reflect_on_memory',
+  `Ask the memory system to reason over stored knowledge and give a synthesized answer. Unlike recall (which returns raw memories), reflect generates a thoughtful response grounded in everything remembered. Use for strategic questions, synthesis, and "what should we do?" type queries.`,
+  {
+    query: z.string().describe('The question to reflect on: "Given what we know about Taylor market, what should our go-to-market strategy be?"'),
+    max_tokens: z.number().optional().describe('Context budget for memories used in reflection (default 4096)'),
+    tags: z.array(z.string()).optional().describe('Filter memories used for reflection by tags'),
+  },
+  async (args) => {
+    if (!HINDSIGHT_KEY) {
+      return { content: [{ type: 'text' as const, text: 'Hindsight memory not configured (no API key).' }], isError: true };
+    }
+    try {
+      const body: Record<string, any> = {
+        query: args.query,
+        max_tokens: args.max_tokens || 4096,
+      };
+      if (args.tags && args.tags.length > 0) {
+        body.tags = args.tags;
+        body.tags_match = 'any';
+      }
+      const result = await hindsightRequest('POST', `/v1/default/banks/${HINDSIGHT_BANK}/reflect`, body);
+      return { content: [{ type: 'text' as const, text: result.response || 'No reflection generated.' }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Memory reflect failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
   },
 );
 
